@@ -12,11 +12,54 @@ import UIKit
 import RxCocoa
 import RxSwift
 
+public protocol KeyboardStateType {
+  var frame: CGRect { get }
+  var animationDuration: Double { get }
+}
+
 public protocol RxKeyboardType {
   var frame: Driver<CGRect> { get }
+  var willChangeHeightWithAnimation: Driver<KeyboardStateType> { get }
   var visibleHeight: Driver<CGFloat> { get }
   var willShowVisibleHeight: Driver<CGFloat> { get }
   var isHidden: Driver<Bool> { get }
+}
+
+struct KeyboardState: KeyboardStateType {
+  let frame: CGRect
+  let animationDuration: Double
+  
+  init(frame: CGRect, duration: Double) {
+    self.frame = frame
+    self.animationDuration = duration
+  }
+  
+  func mutateTopPosition(_ positionMutator: (CGFloat) -> (CGFloat)) -> KeyboardState {
+    var newFrame = self.frame
+    newFrame.origin.y = positionMutator(self.frame.origin.y)
+    return KeyboardState(frame: newFrame, duration: self.animationDuration)
+  }
+}
+
+extension KeyboardState {
+  init(fromNotification notification : Notification) {
+    let rectValue = notification.userInfo?[UIKeyboardFrameEndUserInfoKey] as? NSValue
+    self.frame = rectValue?.cgRectValue ?? CGRect.null
+    let animationDuratonValue = notification.userInfo?[UIKeyboardAnimationDurationUserInfoKey] as? Double
+    self.animationDuration = animationDuratonValue ?? 0.0
+  }
+}
+
+extension KeyboardState {
+  init() {
+    self.frame = CGRect(
+      x: 0,
+      y: UIScreen.main.bounds.height,
+      width: UIScreen.main.bounds.width,
+      height: 0
+    )
+    self.animationDuration = 0.0
+  }
 }
 
 /// RxKeyboard provides a reactive way of observing keyboard frame changes.
@@ -30,6 +73,10 @@ public class RxKeyboard: NSObject, RxKeyboardType {
   /// An observable keyboard frame.
   public let frame: Driver<CGRect>
 
+  /// An observable visible height of keyboard with animation duration. Emits keyboard height with animation duration if the keyboard is visible
+  /// or `0` if the keyboard is not visible.
+  public let willChangeHeightWithAnimation: Driver<KeyboardStateType>
+    
   /// An observable visible height of keyboard. Emits keyboard height if the keyboard is visible
   /// or `0` if the keyboard is not visible.
   public let visibleHeight: Driver<CGFloat>
@@ -51,15 +98,16 @@ public class RxKeyboard: NSObject, RxKeyboardType {
   // MARK: Initializing
 
   override init() {
-    let defaultFrame = CGRect(
-      x: 0,
-      y: UIScreen.main.bounds.height,
-      width: UIScreen.main.bounds.width,
-      height: 0
-    )
-    let frameVariable = BehaviorRelay<CGRect>(value: defaultFrame)
+
+    let stateVariable = BehaviorRelay<KeyboardState>(value: KeyboardState())
+    let frameVariable = stateVariable.map { $0.frame }
     self.frame = frameVariable.asDriver().distinctUntilChanged()
     self.visibleHeight = self.frame.map { UIScreen.main.bounds.height - $0.origin.y }
+    self.willChangeHeightWithAnimation = stateVariable
+      .map { state -> KeyboardState in
+        return state.mutateTopPosition { yPos in UIScreen.main.bounds.height - yPos }
+      }
+      .asDriver()
     self.willShowVisibleHeight = self.visibleHeight
       .scan((visibleHeight: 0, isShowing: false)) { lastState, newVisibleHeight in
         return (visibleHeight: newVisibleHeight, isShowing: lastState.visibleHeight == 0 && newVisibleHeight > 0)
@@ -71,51 +119,45 @@ public class RxKeyboard: NSObject, RxKeyboardType {
 
     // keyboard will change frame
     let willChangeFrame = NotificationCenter.default.rx.notification(.UIKeyboardWillChangeFrame)
-      .map { notification -> CGRect in
-        let rectValue = notification.userInfo?[UIKeyboardFrameEndUserInfoKey] as? NSValue
-        return rectValue?.cgRectValue ?? defaultFrame
+      .map { notification -> KeyboardState in
+        return KeyboardState(fromNotification: notification)
       }
-      .map { frame -> CGRect in
-        if frame.origin.y < 0 { // if went to wrong frame
-          var newFrame = frame
-          newFrame.origin.y = UIScreen.main.bounds.height - newFrame.height
-          return newFrame
+      .map { state -> KeyboardState in
+        if state.frame.origin.y < 0 { // if went to wrong frame
+          return state.mutateTopPosition { yPos in UIScreen.main.bounds.height - yPos}
         }
-        return frame
+        return state
       }
 
     // keyboard will hide
     let willHide = NotificationCenter.default.rx.notification(.UIKeyboardWillHide)
-      .map { notification -> CGRect in
-        let rectValue = notification.userInfo?[UIKeyboardFrameEndUserInfoKey] as? NSValue
-        return rectValue?.cgRectValue ?? defaultFrame
+      .map { notification -> KeyboardState in
+        return KeyboardState(fromNotification: notification)
       }
-      .map { frame -> CGRect in
-        if frame.origin.y < 0 { // if went to wrong frame
-          var newFrame = frame
-          newFrame.origin.y = UIScreen.main.bounds.height
-          return newFrame
+      .map { state -> KeyboardState in
+        if state.frame.origin.y < 0 { // if went to wrong frame
+          return state.mutateTopPosition { _ in UIScreen.main.bounds.height}
         }
-        return frame
+        return state
       }
 
     // pan gesture
     let didPan = self.panRecognizer.rx.event
-      .withLatestFrom(frameVariable.asObservable()) { ($0, $1) }
-      .flatMap { (gestureRecognizer, frame) -> Observable<CGRect> in
+      .withLatestFrom(stateVariable.asObservable()) { ($0, $1) }
+      .flatMap { (gestureRecognizer, state) -> Observable<KeyboardState> in
         guard case .changed = gestureRecognizer.state,
           let window = UIApplication.shared.windows.first,
-          frame.origin.y < UIScreen.main.bounds.height
+          state.frame.origin.y < UIScreen.main.bounds.height
         else { return .empty() }
         let origin = gestureRecognizer.location(in: window)
-        var newFrame = frame
-        newFrame.origin.y = max(origin.y, UIScreen.main.bounds.height - frame.height)
-        return .just(newFrame)
+        var newFrame = state.frame
+        newFrame.origin.y = max(origin.y, UIScreen.main.bounds.height - state.frame.height)
+        return .just(KeyboardState(frame: newFrame, duration: 0.0))
       }
 
     // merge into single sequence
     Observable.of(didPan, willChangeFrame, willHide).merge()
-      .bind(to: frameVariable)
+      .bind(to: stateVariable)
       .disposed(by: self.disposeBag)
 
     // gesture recognizer
@@ -131,6 +173,19 @@ public class RxKeyboard: NSObject, RxKeyboardType {
 
 }
 
+extension Observable where Element == CGRect {
+  public func asDriver() -> Driver<Element> {
+    let source = self.observeOn(DriverSharingStrategy.scheduler)
+    return source.asDriver(onErrorJustReturn: CGRect.null)
+  }
+}
+
+extension Observable where Element == KeyboardStateType {
+  public func asDriver() -> Driver<Element> {
+    let source = self.observeOn(DriverSharingStrategy.scheduler)
+    return source.asDriver(onErrorJustReturn: KeyboardState())
+  }
+}
 
 // MARK: - UIGestureRecognizerDelegate
 

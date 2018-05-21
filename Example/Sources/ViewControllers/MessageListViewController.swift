@@ -114,6 +114,12 @@ class MessageListViewController: UIViewController {
         self.collectionView.contentOffset.y += keyboardVisibleHeight
       })
       .disposed(by: self.disposeBag)
+    
+    RxKeyboard.instance.willChangeHeightWithAnimation
+      .drive(onNext: { state in
+        NSLog("Receive state %f", state.animationDuration)
+      })
+      .disposed(by: self.disposeBag)
 
     self.messageInputBar.rx.sendButtonTap
       .subscribe(onNext: { [weak self] text in
